@@ -28,7 +28,6 @@ type CodeData struct {
 
 var (
 	codes      = make(map[string]CodeData)
-	verified   = make(map[string]bool)
 	rateLimits = make(map[string][]time.Time)
 
 	mu        sync.Mutex
@@ -152,7 +151,7 @@ func initDB() {
 		id SERIAL PRIMARY KEY,
 		email TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
-		verified BOOLEAN DEFAULT TRUE,
+		verified BOOLEAN DEFAULT FALSE,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);`
 
@@ -240,7 +239,11 @@ func verifyCodeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	delete(codes, email)
-	verified[email] = true
+
+	_, err := db.Exec("UPDATE users SET verified = TRUE WHERE email = $1", email)
+	if err != nil {
+		log.Println("Verify DB error:", err)
+	}
 
 	jsonResponse(w, 200, map[string]string{"status": "verified"})
 }
@@ -270,15 +273,6 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	if !verified[email] {
-		mu.Unlock()
-		jsonResponse(w, 403, map[string]string{"error": "Email not verified"})
-		return
-	}
-	delete(verified, email)
-	mu.Unlock()
-
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		jsonResponse(w, 500, map[string]string{"error": "Password hash error"})
@@ -286,7 +280,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, err = db.Exec(
-		"INSERT INTO users (email, password_hash, verified) VALUES ($1, $2, TRUE)",
+		"INSERT INTO users (email, password_hash, verified) VALUES ($1, $2, FALSE)",
 		email,
 		string(hash),
 	)
@@ -320,7 +314,12 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	password := r.FormValue("password")
 
 	var passwordHash string
-	err := db.QueryRow("SELECT password_hash FROM users WHERE email = $1", email).Scan(&passwordHash)
+	var isVerified bool
+
+	err := db.QueryRow(
+		"SELECT password_hash, verified FROM users WHERE email = $1",
+		email,
+	).Scan(&passwordHash, &isVerified)
 
 	if err == sql.ErrNoRows {
 		jsonResponse(w, 400, map[string]string{"error": "Invalid credentials"})
@@ -330,6 +329,11 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Println("Login DB error:", err)
 		jsonResponse(w, 500, map[string]string{"error": "Database error"})
+		return
+	}
+
+	if !isVerified {
+		jsonResponse(w, 403, map[string]string{"error": "Email not verified"})
 		return
 	}
 
