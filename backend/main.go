@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/gomail.v2"
 )
@@ -24,35 +26,15 @@ type CodeData struct {
 	Attempts  int
 }
 
-type User struct {
-	Email        string `json:"email"`
-	PasswordHash string `json:"password_hash"`
-	Verified     bool   `json:"verified"`
-}
-
 var (
 	codes      = make(map[string]CodeData)
 	verified   = make(map[string]bool)
-	users      = make(map[string]User)
 	rateLimits = make(map[string][]time.Time)
 
 	mu        sync.Mutex
-	usersFile = "users.json"
 	jwtSecret []byte
+	db        *sql.DB
 )
-
-func loadUsers() {
-	file, err := os.ReadFile(usersFile)
-	if err != nil {
-		return
-	}
-	_ = json.Unmarshal(file, &users)
-}
-
-func saveUsers() {
-	data, _ := json.MarshalIndent(users, "", "  ")
-	_ = os.WriteFile(usersFile, data, 0644)
-}
 
 func jsonResponse(w http.ResponseWriter, status int, data map[string]string) {
 	w.Header().Set("Content-Type", "application/json")
@@ -93,8 +75,7 @@ func checkRateLimit(key string, max int, window time.Duration) bool {
 		return false
 	}
 
-	fresh = append(fresh, now)
-	rateLimits[key] = fresh
+	rateLimits[key] = append(fresh, now)
 	return true
 }
 
@@ -150,6 +131,38 @@ func parseJWT(tokenStr string) (string, error) {
 	return email, nil
 }
 
+func initDB() {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL is empty")
+	}
+
+	var err error
+	db, err = sql.Open("postgres", databaseURL)
+	if err != nil {
+		log.Fatal("DB open error:", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		log.Fatal("DB ping error:", err)
+	}
+
+	query := `
+	CREATE TABLE IF NOT EXISTS users (
+		id SERIAL PRIMARY KEY,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		verified BOOLEAN DEFAULT TRUE,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);`
+
+	if _, err := db.Exec(query); err != nil {
+		log.Fatal("Create users table error:", err)
+	}
+
+	fmt.Println("PostgreSQL connected")
+}
+
 // ---------- HANDLERS ----------
 
 func sendCodeHandler(w http.ResponseWriter, r *http.Request) {
@@ -160,9 +173,7 @@ func sendCodeHandler(w http.ResponseWriter, r *http.Request) {
 
 	ip := getIP(r)
 	if !checkRateLimit("send-code:"+ip, 2, 5*time.Minute) {
-		jsonResponse(w, 429, map[string]string{
-			"error": "Too many code requests. Try again later.",
-		})
+		jsonResponse(w, 429, map[string]string{"error": "Too many code requests. Try again later."})
 		return
 	}
 
@@ -242,9 +253,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 
 	ip := getIP(r)
 	if !checkRateLimit("register:"+ip, 3, 5*time.Minute) {
-		jsonResponse(w, 429, map[string]string{
-			"error": "Too many register attempts. Try again later.",
-		})
+		jsonResponse(w, 429, map[string]string{"error": "Too many register attempts. Try again later."})
 		return
 	}
 
@@ -262,17 +271,13 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.Lock()
-	defer mu.Unlock()
-
 	if !verified[email] {
+		mu.Unlock()
 		jsonResponse(w, 403, map[string]string{"error": "Email not verified"})
 		return
 	}
-
-	if _, exists := users[email]; exists {
-		jsonResponse(w, 400, map[string]string{"error": "User already exists"})
-		return
-	}
+	delete(verified, email)
+	mu.Unlock()
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
@@ -280,14 +285,21 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	users[email] = User{
-		Email:        email,
-		PasswordHash: string(hash),
-		Verified:     true,
-	}
+	_, err = db.Exec(
+		"INSERT INTO users (email, password_hash, verified) VALUES ($1, $2, TRUE)",
+		email,
+		string(hash),
+	)
 
-	delete(verified, email)
-	saveUsers()
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate") {
+			jsonResponse(w, 400, map[string]string{"error": "User already exists"})
+			return
+		}
+		log.Println("Register DB error:", err)
+		jsonResponse(w, 500, map[string]string{"error": "Database error"})
+		return
+	}
 
 	jsonResponse(w, 200, map[string]string{"status": "registered"})
 }
@@ -300,26 +312,28 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	ip := getIP(r)
 	if !checkRateLimit("login:"+ip, 5, 5*time.Minute) {
-		jsonResponse(w, 429, map[string]string{
-			"error": "Too many login attempts. Try again later.",
-		})
+		jsonResponse(w, 429, map[string]string{"error": "Too many login attempts. Try again later."})
 		return
 	}
 
 	email := r.FormValue("email")
 	password := r.FormValue("password")
 
-	mu.Lock()
-	user, exists := users[email]
-	mu.Unlock()
+	var passwordHash string
+	err := db.QueryRow("SELECT password_hash FROM users WHERE email = $1", email).Scan(&passwordHash)
 
-	if !exists {
+	if err == sql.ErrNoRows {
 		jsonResponse(w, 400, map[string]string{"error": "Invalid credentials"})
 		return
 	}
 
-	err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password))
 	if err != nil {
+		log.Println("Login DB error:", err)
+		jsonResponse(w, 500, map[string]string{"error": "Database error"})
+		return
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)); err != nil {
 		jsonResponse(w, 400, map[string]string{"error": "Invalid credentials"})
 		return
 	}
@@ -355,22 +369,21 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jsonResponse(w, 200, map[string]string{
-		"email": email,
-	})
+	jsonResponse(w, 200, map[string]string{"email": email})
 }
 
 // ---------- MAIN ----------
 
 func main() {
 	_ = godotenv.Load()
-	loadUsers()
 
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
-		log.Fatal("JWT_SECRET is empty in .env")
+		log.Fatal("JWT_SECRET is empty")
 	}
 	jwtSecret = []byte(secret)
+
+	initDB()
 
 	http.HandleFunc("/api/auth/send-code", sendCodeHandler)
 	http.HandleFunc("/api/auth/verify-code", verifyCodeHandler)
