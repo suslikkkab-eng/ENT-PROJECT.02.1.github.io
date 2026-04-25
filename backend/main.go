@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
@@ -20,6 +21,9 @@ import (
 	"gopkg.in/gomail.v2"
 )
 
+var db *sql.DB
+var jwtSecret []byte
+
 type CodeData struct {
 	Code      string
 	ExpiresAt time.Time
@@ -29,28 +33,27 @@ type CodeData struct {
 var (
 	codes      = make(map[string]CodeData)
 	rateLimits = make(map[string][]time.Time)
-
-	mu        sync.Mutex
-	jwtSecret []byte
-	db        *sql.DB
+	mu         sync.Mutex
 )
 
-func jsonResponse(w http.ResponseWriter, status int, data map[string]string) {
+// ---------- UTILS ----------
+
+func jsonResponse(w http.ResponseWriter, status int, data map[string]interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+	json.NewEncoder(w).Encode(data)
 }
 
 func cors(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 }
 
 func getIP(r *http.Request) string {
 	ip := r.Header.Get("X-Forwarded-For")
 	if ip != "" {
-		return strings.TrimSpace(strings.Split(ip, ",")[0])
+		return strings.Split(ip, ",")[0]
 	}
 	return strings.Split(r.RemoteAddr, ":")[0]
 }
@@ -70,7 +73,6 @@ func checkRateLimit(key string, max int, window time.Duration) bool {
 	}
 
 	if len(fresh) >= max {
-		rateLimits[key] = fresh
 		return false
 	}
 
@@ -83,23 +85,23 @@ func generateCode() string {
 	return fmt.Sprintf("%06d", n.Int64())
 }
 
+// ---------- EMAIL ----------
+
 func sendEmail(to, code string) error {
 	from := os.Getenv("SMTP_EMAIL")
 	pass := os.Getenv("SMTP_PASSWORD")
-
-	if from == "" || pass == "" {
-		return fmt.Errorf("SMTP_EMAIL or SMTP_PASSWORD is empty")
-	}
 
 	m := gomail.NewMessage()
 	m.SetHeader("From", from)
 	m.SetHeader("To", to)
 	m.SetHeader("Subject", "Код подтверждения")
-	m.SetBody("text/plain", "Ваш код подтверждения: "+code+"\n\nКод действует 10 минут.")
+	m.SetBody("text/plain", "Ваш код: "+code)
 
 	d := gomail.NewDialer("smtp.gmail.com", 587, from, pass)
 	return d.DialAndSend(m)
 }
+
+// ---------- JWT ----------
 
 func generateJWT(email string) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
@@ -116,94 +118,129 @@ func parseJWT(tokenStr string) (string, error) {
 	if err != nil || !token.Valid {
 		return "", fmt.Errorf("invalid token")
 	}
-
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
 		return "", fmt.Errorf("invalid claims")
 	}
-
-	email, ok := claims["email"].(string)
-	if !ok {
-		return "", fmt.Errorf("email not found")
-	}
-
-	return email, nil
+	return claims["email"].(string), nil
 }
 
+// ---------- DB ----------
+
 func initDB() {
-	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
-		log.Fatal("DATABASE_URL is empty")
-	}
-
 	var err error
-	db, err = sql.Open("postgres", databaseURL)
+	db, err = sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
-		log.Fatal("DB open error:", err)
+		log.Fatal(err)
 	}
 
-	if err := db.Ping(); err != nil {
-		log.Fatal("DB ping error:", err)
-	}
+	db.Ping()
 
-	query := `
-	CREATE TABLE IF NOT EXISTS users (
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS users (
 		id SERIAL PRIMARY KEY,
-		email TEXT UNIQUE NOT NULL,
-		password_hash TEXT NOT NULL,
-		verified BOOLEAN DEFAULT FALSE,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);`
+		email TEXT UNIQUE,
+		password_hash TEXT,
+		verified BOOLEAN DEFAULT FALSE
+	)`); err != nil {
+		log.Println("DB error:", err)
+	}
 
-	if _, err := db.Exec(query); err != nil {
-		log.Fatal("Create users table error:", err)
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS profiles (
+		user_id INTEGER UNIQUE,
+		name TEXT,
+		avatar_url TEXT
+	)`); err != nil {
+		log.Println("DB error:", err)
+	}
+
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS test_results (
+		id SERIAL PRIMARY KEY,
+		user_id INTEGER,
+		subject TEXT,
+		score INTEGER,
+		total INTEGER,
+		percent FLOAT,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		log.Println("DB error:", err)
 	}
 
 	fmt.Println("PostgreSQL connected")
+
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS refresh_tokens (
+		id SERIAL PRIMARY KEY,
+		user_id INTEGER,
+		token TEXT,
+		expires_at TIMESTAMP
+	)`); err != nil {
+		log.Println("DB error:", err)
+	}
 }
 
-// ---------- HANDLERS ----------
+func generateRefreshToken() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
+
+// ---------- MIDDLEWARE ----------
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cors(w)
+
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			jsonResponse(w, 401, map[string]interface{}{"error": "No token"})
+			return
+		}
+
+		tokenStr := strings.Replace(auth, "Bearer ", "", 1)
+
+		email, err := parseJWT(tokenStr)
+		if err != nil {
+			jsonResponse(w, 401, map[string]interface{}{"error": "Invalid token"})
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), "userEmail", email)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+// ---------- AUTH ----------
 
 func sendCodeHandler(w http.ResponseWriter, r *http.Request) {
 	cors(w)
-	if r.Method == "OPTIONS" {
-		return
-	}
 
 	ip := getIP(r)
-	if !checkRateLimit("send-code:"+ip, 2, 5*time.Minute) {
-		jsonResponse(w, 429, map[string]string{"error": "Too many code requests. Try again later."})
+	if !checkRateLimit("send:"+ip, 2, 5*time.Minute) {
+		jsonResponse(w, 429, map[string]interface{}{"error": "Too many requests"})
 		return
 	}
 
 	email := r.URL.Query().Get("email")
-	if !strings.Contains(email, "@") {
-		jsonResponse(w, 400, map[string]string{"error": "Invalid email"})
-		return
-	}
-
 	code := generateCode()
 
 	mu.Lock()
-	codes[email] = CodeData{
-		Code:      code,
-		ExpiresAt: time.Now().Add(10 * time.Minute),
-		Attempts:  0,
-	}
+	codes[email] = CodeData{Code: code, ExpiresAt: time.Now().Add(10 * time.Minute)}
 	mu.Unlock()
 
 	if err := sendEmail(email, code); err != nil {
-		log.Println("Email error:", err)
-		jsonResponse(w, 500, map[string]string{"error": "Failed to send email"})
+		log.Println("email error:", err)
+		jsonResponse(w, 500, map[string]interface{}{"error": "email failed"})
 		return
 	}
 
-	jsonResponse(w, 200, map[string]string{"status": "code_sent"})
+	jsonResponse(w, 200, map[string]interface{}{"status": "sent"})
 }
 
 func verifyCodeHandler(w http.ResponseWriter, r *http.Request) {
 	cors(w)
-	if r.Method == "OPTIONS" {
+
+	ip := getIP(r)
+	if !checkRateLimit("verify:"+ip, 5, 5*time.Minute) {
+		jsonResponse(w, 429, map[string]interface{}{"error": "Too many attempts"})
 		return
 	}
 
@@ -211,181 +248,395 @@ func verifyCodeHandler(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 
 	mu.Lock()
-	defer mu.Unlock()
-
-	data, ok := codes[email]
-	if !ok {
-		jsonResponse(w, 400, map[string]string{"error": "Code not found"})
-		return
-	}
+	data := codes[email]
+	mu.Unlock()
 
 	if time.Now().After(data.ExpiresAt) {
+		jsonResponse(w, 400, map[string]interface{}{"error": "expired"})
+		return
+	}
+
+	if data.Code == code {
 		delete(codes, email)
-		jsonResponse(w, 400, map[string]string{"error": "Code expired"})
+		if _, err := db.Exec("UPDATE users SET verified=true WHERE email=$1", email); err != nil {
+			log.Println("DB error:", err)
+		}
+		jsonResponse(w, 200, map[string]interface{}{"status": "verified"})
 		return
 	}
 
-	if data.Attempts >= 5 {
-		delete(codes, email)
-		jsonResponse(w, 429, map[string]string{"error": "Too many attempts"})
-		return
-	}
-
-	if data.Code != code {
-		data.Attempts++
-		codes[email] = data
-		jsonResponse(w, 400, map[string]string{"error": "Invalid code"})
-		return
-	}
-
-	delete(codes, email)
-
-	_, err := db.Exec("UPDATE users SET verified = TRUE WHERE email = $1", email)
-	if err != nil {
-		log.Println("Verify DB error:", err)
-	}
-
-	jsonResponse(w, 200, map[string]string{"status": "verified"})
+	jsonResponse(w, 400, map[string]interface{}{"error": "invalid"})
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	cors(w)
-	if r.Method == "OPTIONS" {
-		return
-	}
 
 	ip := getIP(r)
 	if !checkRateLimit("register:"+ip, 3, 5*time.Minute) {
-		jsonResponse(w, 429, map[string]string{"error": "Too many register attempts. Try again later."})
+		jsonResponse(w, 429, map[string]interface{}{"error": "Too many registrations"})
 		return
 	}
 
 	email := r.FormValue("email")
-	password := r.FormValue("password")
+	pass := r.FormValue("password")
 
-	if email == "" || password == "" {
-		jsonResponse(w, 400, map[string]string{"error": "Missing fields"})
-		return
-	}
+	hash, _ := bcrypt.GenerateFromPassword([]byte(pass), 10)
 
-	if len(password) < 6 {
-		jsonResponse(w, 400, map[string]string{"error": "Password must be at least 6 characters"})
-		return
-	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	_, err := db.Exec("INSERT INTO users (email,password_hash,verified) VALUES ($1,$2,false)", email, string(hash))
 	if err != nil {
-		jsonResponse(w, 500, map[string]string{"error": "Password hash error"})
+		jsonResponse(w, 400, map[string]interface{}{"error": "exists"})
 		return
 	}
 
-	_, err = db.Exec(
-		"INSERT INTO users (email, password_hash, verified) VALUES ($1, $2, FALSE)",
-		email,
-		string(hash),
-	)
-
-	if err != nil {
-		if strings.Contains(err.Error(), "duplicate") {
-			jsonResponse(w, 400, map[string]string{"error": "User already exists"})
-			return
-		}
-		log.Println("Register DB error:", err)
-		jsonResponse(w, 500, map[string]string{"error": "Database error"})
-		return
-	}
-
-	jsonResponse(w, 200, map[string]string{"status": "registered"})
+	jsonResponse(w, 200, map[string]interface{}{"status": "ok"})
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	cors(w)
-	if r.Method == "OPTIONS" {
-		return
-	}
 
 	ip := getIP(r)
 	if !checkRateLimit("login:"+ip, 5, 5*time.Minute) {
-		jsonResponse(w, 429, map[string]string{"error": "Too many login attempts. Try again later."})
+		jsonResponse(w, 429, map[string]interface{}{"error": "Too many login attempts"})
 		return
 	}
 
 	email := r.FormValue("email")
-	password := r.FormValue("password")
+	pass := r.FormValue("password")
 
-	var passwordHash string
-	var isVerified bool
+	var hash string
+	var verified bool
 
-	err := db.QueryRow(
-		"SELECT password_hash, verified FROM users WHERE email = $1",
-		email,
-	).Scan(&passwordHash, &isVerified)
-
-	if err == sql.ErrNoRows {
-		jsonResponse(w, 400, map[string]string{"error": "Invalid credentials"})
+	err := db.QueryRow("SELECT password_hash,verified FROM users WHERE email=$1", email).Scan(&hash, &verified)
+	if err != nil || !verified {
+		jsonResponse(w, 400, map[string]interface{}{"error": "invalid"})
 		return
 	}
 
-	if err != nil {
-		log.Println("Login DB error:", err)
-		jsonResponse(w, 500, map[string]string{"error": "Database error"})
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)) != nil {
+		jsonResponse(w, 400, map[string]interface{}{"error": "invalid"})
 		return
 	}
 
-	if !isVerified {
-		jsonResponse(w, 403, map[string]string{"error": "Email not verified"})
-		return
+	token, _ := generateJWT(email)
+
+	var id int
+	db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id)
+
+	refresh := generateRefreshToken()
+	if _, err = db.Exec(
+		"INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1,$2,$3)",
+		id, refresh, time.Now().Add(72*24*time.Hour),
+	); err != nil {
+		log.Println("DB error:", err)
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)); err != nil {
-		jsonResponse(w, 400, map[string]string{"error": "Invalid credentials"})
-		return
-	}
-
-	token, err := generateJWT(email)
-	if err != nil {
-		jsonResponse(w, 500, map[string]string{"error": "Token error"})
-		return
-	}
-
-	jsonResponse(w, 200, map[string]string{
-		"status": "login_success",
-		"token":  token,
-	})
+	jsonResponse(w, 200, map[string]interface{}{"token": token, "refresh": refresh})
 }
 
 func meHandler(w http.ResponseWriter, r *http.Request) {
 	cors(w)
-	if r.Method == "OPTIONS" {
+
+	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
+	email, _ := parseJWT(token)
+
+	jsonResponse(w, 200, map[string]interface{}{"email": email})
+}
+
+// ---------- PROFILE ----------
+
+func profileHandler(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+
+	ip := getIP(r)
+	if !checkRateLimit("profile:"+ip, 10, 5*time.Minute) {
+		jsonResponse(w, 429, map[string]interface{}{"error": "Too many requests"})
 		return
 	}
 
-	auth := r.Header.Get("Authorization")
-	if auth == "" {
-		jsonResponse(w, 401, map[string]string{"error": "No token"})
+	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
+	email, _ := parseJWT(token)
+
+	var id int
+	db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id)
+
+	if r.Method == "POST" {
+		name := r.FormValue("name")
+		avatar := r.FormValue("avatar")
+
+		if _, err := db.Exec(`INSERT INTO profiles (user_id,name,avatar_url)
+		VALUES($1,$2,$3)
+		ON CONFLICT (user_id) DO UPDATE SET name=$2,avatar_url=$3`,
+			id, name, avatar); err != nil {
+			log.Println("DB error:", err)
+		}
+
+		jsonResponse(w, 200, map[string]interface{}{"status": "updated"})
 		return
 	}
 
-	tokenStr := strings.Replace(auth, "Bearer ", "", 1)
-	email, err := parseJWT(tokenStr)
+	var name, avatar string
+	db.QueryRow("SELECT name,avatar_url FROM profiles WHERE user_id=$1", id).Scan(&name, &avatar)
+
+	jsonResponse(w, 200, map[string]interface{}{"name": name, "avatar": avatar})
+}
+
+// ---------- TEST RESULTS ----------
+
+func addResultHandler(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+
+	ip := getIP(r)
+	if !checkRateLimit("tests:"+ip, 10, 5*time.Minute) {
+		jsonResponse(w, 429, map[string]interface{}{"error": "Too many test submissions"})
+		return
+	}
+
+	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
+	email, _ := parseJWT(token)
+
+	var id int
+	db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id)
+
+	subject := r.FormValue("subject")
+	score := r.FormValue("score")
+	total := r.FormValue("total")
+
+	var scoreInt, totalInt int
+	fmt.Sscanf(score, "%d", &scoreInt)
+	fmt.Sscanf(total, "%d", &totalInt)
+
+	percent := 0.0
+	if totalInt > 0 {
+		percent = float64(scoreInt) / float64(totalInt) * 100
+	}
+
+	if _, err := db.Exec("INSERT INTO test_results (user_id,subject,score,total,percent) VALUES ($1,$2,$3,$4,$5)",
+		id, subject, scoreInt, totalInt, percent); err != nil {
+		log.Println("DB error:", err)
+	}
+
+	jsonResponse(w, 200, map[string]interface{}{"status": "saved"})
+}
+
+func getResultsHandler(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+
+	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
+	email, _ := parseJWT(token)
+
+	var id int
+	db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id)
+
+	rows, err := db.Query("SELECT subject,score,total FROM test_results WHERE user_id=$1", id)
 	if err != nil {
-		jsonResponse(w, 401, map[string]string{"error": "Invalid token"})
+		jsonResponse(w, 500, map[string]interface{}{"error": "DB error"})
+		return
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+
+	for rows.Next() {
+		var s string
+		var sc, t int
+		rows.Scan(&s, &sc, &t)
+
+		results = append(results, map[string]interface{}{
+			"subject": s,
+			"score":   sc,
+			"total":   t,
+		})
+	}
+
+	jsonResponse(w, 200, map[string]interface{}{"results": results})
+}
+
+// ---------- STATS ----------
+
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+
+	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
+	email, _ := parseJWT(token)
+
+	var id int
+	db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id)
+
+	var count int
+	var avg float64
+
+	db.QueryRow("SELECT COUNT(*),COALESCE(AVG(score),0) FROM test_results WHERE user_id=$1", id).Scan(&count, &avg)
+
+	jsonResponse(w, 200, map[string]interface{}{
+		"total_tests": count,
+		"avg_score":   avg,
+	})
+}
+
+// ---------- LEADERBOARD ----------
+
+func leaderboardHandler(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+
+	rows, err := db.Query(`
+SELECT u.email,
+       COALESCE(p.name, '') as name,
+       COALESCE(p.avatar_url, '') as avatar,
+       COALESCE(AVG(t.percent), 0) as avg_score,
+       COUNT(t.id) as total_tests
+FROM users u
+LEFT JOIN test_results t ON u.id = t.user_id
+LEFT JOIN profiles p ON u.id = p.user_id
+WHERE u.verified = true
+GROUP BY u.id, p.name, p.avatar_url
+ORDER BY avg_score DESC, total_tests DESC
+LIMIT 20
+`)
+	if err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "DB error"})
+		return
+	}
+	defer rows.Close()
+
+	var list []map[string]interface{}
+
+	rank := 1
+
+	for rows.Next() {
+		var email string
+		var name string
+		var avatar string
+		var avg float64
+		var count int
+
+		if err := rows.Scan(&email, &name, &avatar, &avg, &count); err != nil {
+			continue
+		}
+
+		list = append(list, map[string]interface{}{
+			"rank":        rank,
+			"email":       email,
+			"name":        name,
+			"avatar":      avatar,
+			"avg_score":   avg,
+			"total_tests": count,
+		})
+		rank++
+	}
+
+	jsonResponse(w, 200, map[string]interface{}{
+		"leaderboard": list,
+	})
+}
+
+// ---------- REFRESH / LOGOUT ----------
+
+func refreshHandler(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+
+	ip := getIP(r)
+	if !checkRateLimit("refresh:"+ip, 10, 5*time.Minute) {
+		jsonResponse(w, 429, map[string]interface{}{"error": "Too many requests"})
 		return
 	}
 
-	jsonResponse(w, 200, map[string]string{"email": email})
+	refresh := r.FormValue("refresh")
+
+	var userID int
+	err := db.QueryRow(
+		"SELECT user_id FROM refresh_tokens WHERE token=$1 AND expires_at > NOW()",
+		refresh,
+	).Scan(&userID)
+
+	if err != nil {
+		jsonResponse(w, 401, map[string]interface{}{"error": "invalid refresh"})
+		return
+	}
+
+	_, err = db.Exec("DELETE FROM refresh_tokens WHERE token=$1", refresh)
+	if err != nil {
+		log.Println("DB error:", err)
+	}
+
+	newRefresh := generateRefreshToken()
+
+	_, err = db.Exec(
+		"INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1,$2,$3)",
+		userID, newRefresh, time.Now().Add(72*time.Hour),
+	)
+	if err != nil {
+		log.Println("DB error:", err)
+	}
+
+	var email string
+	db.QueryRow("SELECT email FROM users WHERE id=$1", userID).Scan(&email)
+
+	newToken, _ := generateJWT(email)
+
+	jsonResponse(w, 200, map[string]interface{}{
+		"token":   newToken,
+		"refresh": newRefresh,
+	})
+}
+
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+
+	refresh := r.FormValue("refresh")
+
+	if _, err := db.Exec("DELETE FROM refresh_tokens WHERE token=$1", refresh); err != nil {
+		log.Println("DB error:", err)
+	}
+
+	jsonResponse(w, 200, map[string]interface{}{
+		"status": "logged out",
+	})
+}
+
+// ---------- MY RANK ----------
+
+func myRankHandler(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+
+	email := r.Context().Value("userEmail").(string)
+
+	var userID int
+	err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&userID)
+	if err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "User not found"})
+		return
+	}
+
+	row := db.QueryRow(`
+SELECT rank FROM (
+	SELECT u.id,
+	       RANK() OVER (ORDER BY COALESCE(AVG(t.percent),0) DESC, COUNT(t.id) DESC) as rank
+	FROM users u
+	LEFT JOIN test_results t ON u.id = t.user_id
+	WHERE u.verified = true
+	GROUP BY u.id
+) ranked
+WHERE id = $1
+`, userID)
+
+	var rank int
+	err = row.Scan(&rank)
+	if err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "Rank not found"})
+		return
+	}
+
+	jsonResponse(w, 200, map[string]interface{}{
+		"rank": rank,
+	})
 }
 
 // ---------- MAIN ----------
 
 func main() {
-	_ = godotenv.Load()
+	godotenv.Load()
 
-	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		log.Fatal("JWT_SECRET is empty")
-	}
-	jwtSecret = []byte(secret)
+	jwtSecret = []byte(os.Getenv("JWT_SECRET"))
 
 	initDB()
 
@@ -395,11 +646,22 @@ func main() {
 	http.HandleFunc("/api/auth/login", loginHandler)
 	http.HandleFunc("/api/auth/me", meHandler)
 
+	http.HandleFunc("/api/profile", authMiddleware(profileHandler))
+
+	http.HandleFunc("/api/tests/add", authMiddleware(addResultHandler))
+	http.HandleFunc("/api/tests/list", authMiddleware(getResultsHandler))
+
+	http.HandleFunc("/api/stats", authMiddleware(statsHandler))
+	http.HandleFunc("/api/leaderboard", authMiddleware(leaderboardHandler))
+	http.HandleFunc("/api/my-rank", authMiddleware(myRankHandler))
+	http.HandleFunc("/api/refresh", refreshHandler)
+	http.HandleFunc("/api/logout", logoutHandler)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
 	fmt.Println("Server running on", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	http.ListenAndServe(":"+port, nil)
 }
