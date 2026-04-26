@@ -44,10 +44,37 @@ func jsonResponse(w http.ResponseWriter, status int, data map[string]interface{}
 	json.NewEncoder(w).Encode(data)
 }
 
-func cors(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+var allowedOrigins = map[string]bool{
+	"https://suslikkkab-eng.github.io": true,
+	"http://localhost:5500":            true,
+	"http://127.0.0.1:5500":           true,
+}
+
+
+func corsWithOrigin(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+
+	log.Println("METHOD:", r.Method, "PATH:", r.URL.Path, "ORIGIN:", origin)
+
+	if origin == "" {
+		return false
+	}
+
+	if !allowedOrigins[origin] {
+		jsonResponse(w, 403, map[string]interface{}{"error": "Origin not allowed"})
+		return true
+	}
+
+	w.Header().Set("Access-Control-Allow-Origin", origin)
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	w.Header().Set("Vary", "Origin")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(204)
+		return true
+	}
+	return false
 }
 
 func getIP(r *http.Request) string {
@@ -187,7 +214,7 @@ func generateRefreshToken() string {
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		cors(w)
+		if corsWithOrigin(w, r) { return }
 
 		auth := r.Header.Get("Authorization")
 		if auth == "" {
@@ -211,7 +238,7 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // ---------- AUTH ----------
 
 func sendCodeHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
+	if corsWithOrigin(w, r) { return }
 
 	ip := getIP(r)
 	if !checkRateLimit("send:"+ip, 2, 5*time.Minute) {
@@ -236,7 +263,7 @@ func sendCodeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func verifyCodeHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
+	if corsWithOrigin(w, r) { return }
 
 	ip := getIP(r)
 	if !checkRateLimit("verify:"+ip, 5, 5*time.Minute) {
@@ -269,7 +296,7 @@ func verifyCodeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
+	if corsWithOrigin(w, r) { return }
 
 	ip := getIP(r)
 	if !checkRateLimit("register:"+ip, 3, 5*time.Minute) {
@@ -292,7 +319,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
+	if corsWithOrigin(w, r) { return }
 
 	ip := getIP(r)
 	if !checkRateLimit("login:"+ip, 5, 5*time.Minute) {
@@ -334,7 +361,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func meHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
+	if corsWithOrigin(w, r) { return }
 
 	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
 	email, _ := parseJWT(token)
@@ -345,7 +372,6 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 // ---------- PROFILE ----------
 
 func profileHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
 
 	ip := getIP(r)
 	if !checkRateLimit("profile:"+ip, 10, 5*time.Minute) {
@@ -383,7 +409,6 @@ func profileHandler(w http.ResponseWriter, r *http.Request) {
 // ---------- TEST RESULTS ----------
 
 func addResultHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
 
 	ip := getIP(r)
 	if !checkRateLimit("tests:"+ip, 10, 5*time.Minute) {
@@ -419,7 +444,6 @@ func addResultHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getResultsHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
 
 	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
 	email, _ := parseJWT(token)
@@ -454,7 +478,6 @@ func getResultsHandler(w http.ResponseWriter, r *http.Request) {
 // ---------- STATS ----------
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
 
 	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
 	email, _ := parseJWT(token)
@@ -476,7 +499,6 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 // ---------- LEADERBOARD ----------
 
 func leaderboardHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
 
 	rows, err := db.Query(`
 SELECT u.email,
@@ -532,7 +554,7 @@ LIMIT 20
 // ---------- REFRESH / LOGOUT ----------
 
 func refreshHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
+	if corsWithOrigin(w, r) { return }
 
 	ip := getIP(r)
 	if !checkRateLimit("refresh:"+ip, 10, 5*time.Minute) {
@@ -580,11 +602,17 @@ func refreshHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
+	email := r.Context().Value("userEmail").(string)
+
+	var userID int
+	if err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&userID); err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "User not found"})
+		return
+	}
 
 	refresh := r.FormValue("refresh")
 
-	if _, err := db.Exec("DELETE FROM refresh_tokens WHERE token=$1", refresh); err != nil {
+	if _, err := db.Exec("DELETE FROM refresh_tokens WHERE token=$1 AND user_id=$2", refresh, userID); err != nil {
 		log.Println("DB error:", err)
 	}
 
@@ -596,7 +624,6 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 // ---------- MY RANK ----------
 
 func myRankHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
 
 	email := r.Context().Value("userEmail").(string)
 
@@ -655,7 +682,7 @@ func main() {
 	http.HandleFunc("/api/leaderboard", authMiddleware(leaderboardHandler))
 	http.HandleFunc("/api/my-rank", authMiddleware(myRankHandler))
 	http.HandleFunc("/api/refresh", refreshHandler)
-	http.HandleFunc("/api/logout", logoutHandler)
+	http.HandleFunc("/api/logout", authMiddleware(logoutHandler))
 
 	port := os.Getenv("PORT")
 	if port == "" {
