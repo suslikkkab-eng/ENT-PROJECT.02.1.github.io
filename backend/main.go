@@ -41,15 +41,17 @@ var (
 func jsonResponse(w http.ResponseWriter, status int, data map[string]interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Println("json encode error:", err)
+	}
 }
 
 var allowedOrigins = map[string]bool{
+	"http://localhost:5173":            true,
 	"https://suslikkkab-eng.github.io": true,
 	"http://localhost:5500":            true,
-	"http://127.0.0.1:5500":           true,
+	"http://127.0.0.1:5500":            true,
 }
-
 
 func corsWithOrigin(w http.ResponseWriter, r *http.Request) bool {
 	origin := r.Header.Get("Origin")
@@ -140,6 +142,9 @@ func generateJWT(email string) (string, error) {
 
 func parseJWT(tokenStr string) (string, error) {
 	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("invalid signing method")
+		}
 		return jwtSecret, nil
 	})
 	if err != nil || !token.Valid {
@@ -149,7 +154,11 @@ func parseJWT(tokenStr string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("invalid claims")
 	}
-	return claims["email"].(string), nil
+	email, ok := claims["email"].(string)
+	if !ok {
+		return "", fmt.Errorf("invalid email")
+	}
+	return email, nil
 }
 
 // ---------- DB ----------
@@ -161,7 +170,9 @@ func initDB() {
 		log.Fatal(err)
 	}
 
-	db.Ping()
+	if err := db.Ping(); err != nil {
+		log.Fatal(err)
+	}
 
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS users (
 		id SERIAL PRIMARY KEY,
@@ -186,13 +197,11 @@ func initDB() {
 		subject TEXT,
 		score INTEGER,
 		total INTEGER,
-		percent FLOAT,
+		percent INTEGER,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	)`); err != nil {
 		log.Println("DB error:", err)
 	}
-
-	fmt.Println("PostgreSQL connected")
 
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS refresh_tokens (
 		id SERIAL PRIMARY KEY,
@@ -202,11 +211,15 @@ func initDB() {
 	)`); err != nil {
 		log.Println("DB error:", err)
 	}
+
+	fmt.Println("PostgreSQL connected")
 }
 
 func generateRefreshToken() string {
 	b := make([]byte, 32)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
 	return fmt.Sprintf("%x", b)
 }
 
@@ -214,7 +227,9 @@ func generateRefreshToken() string {
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if corsWithOrigin(w, r) { return }
+		if corsWithOrigin(w, r) {
+			return
+		}
 
 		auth := r.Header.Get("Authorization")
 		if auth == "" {
@@ -238,7 +253,9 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // ---------- AUTH ----------
 
 func sendCodeHandler(w http.ResponseWriter, r *http.Request) {
-	if corsWithOrigin(w, r) { return }
+	if corsWithOrigin(w, r) {
+		return
+	}
 
 	ip := getIP(r)
 	if !checkRateLimit("send:"+ip, 2, 5*time.Minute) {
@@ -247,6 +264,10 @@ func sendCodeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := r.URL.Query().Get("email")
+	if email == "" {
+		jsonResponse(w, 400, map[string]interface{}{"error": "email required"})
+		return
+	}
 	code := generateCode()
 
 	mu.Lock()
@@ -263,7 +284,9 @@ func sendCodeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func verifyCodeHandler(w http.ResponseWriter, r *http.Request) {
-	if corsWithOrigin(w, r) { return }
+	if corsWithOrigin(w, r) {
+		return
+	}
 
 	ip := getIP(r)
 	if !checkRateLimit("verify:"+ip, 5, 5*time.Minute) {
@@ -274,9 +297,19 @@ func verifyCodeHandler(w http.ResponseWriter, r *http.Request) {
 	email := r.URL.Query().Get("email")
 	code := r.URL.Query().Get("code")
 
+	if email == "" || code == "" {
+		jsonResponse(w, 400, map[string]interface{}{"error": "email and code required"})
+		return
+	}
+
 	mu.Lock()
 	data := codes[email]
 	mu.Unlock()
+
+	if data.Code == "" {
+		jsonResponse(w, 400, map[string]interface{}{"error": "code not found"})
+		return
+	}
 
 	if time.Now().After(data.ExpiresAt) {
 		jsonResponse(w, 400, map[string]interface{}{"error": "expired"})
@@ -284,7 +317,9 @@ func verifyCodeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if data.Code == code {
+		mu.Lock()
 		delete(codes, email)
+		mu.Unlock()
 		if _, err := db.Exec("UPDATE users SET verified=true WHERE email=$1", email); err != nil {
 			log.Println("DB error:", err)
 		}
@@ -296,10 +331,12 @@ func verifyCodeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
-	if corsWithOrigin(w, r) { return }
+	if corsWithOrigin(w, r) {
+		return
+	}
 
 	ip := getIP(r)
-	if !checkRateLimit("register:"+ip, 3, 5*time.Minute) {
+	if !checkRateLimit("register:"+ip, 20, 5*time.Minute) { // DEV: increased from 3
 		jsonResponse(w, 429, map[string]interface{}{"error": "Too many registrations"})
 		return
 	}
@@ -307,9 +344,26 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	email := r.FormValue("email")
 	pass := r.FormValue("password")
 
-	hash, _ := bcrypt.GenerateFromPassword([]byte(pass), 10)
+	if email == "" || pass == "" {
+		jsonResponse(w, 400, map[string]interface{}{"error": "email and password required"})
+		return
+	}
+	if !strings.Contains(email, "@") {
+		jsonResponse(w, 400, map[string]interface{}{"error": "invalid email"})
+		return
+	}
+	if len(pass) < 8 {
+		jsonResponse(w, 400, map[string]interface{}{"error": "password too short"})
+		return
+	}
 
-	_, err := db.Exec("INSERT INTO users (email,password_hash,verified) VALUES ($1,$2,false)", email, string(hash))
+	hash, err := bcrypt.GenerateFromPassword([]byte(pass), 10)
+	if err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "hash failed"})
+		return
+	}
+
+	_, err = db.Exec("INSERT INTO users (email,password_hash,verified) VALUES ($1,$2,true) /* DEV: auto-verify */", email, string(hash))
 	if err != nil {
 		jsonResponse(w, 400, map[string]interface{}{"error": "exists"})
 		return
@@ -319,7 +373,9 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	if corsWithOrigin(w, r) { return }
+	if corsWithOrigin(w, r) {
+		return
+	}
 
 	ip := getIP(r)
 	if !checkRateLimit("login:"+ip, 5, 5*time.Minute) {
@@ -329,6 +385,11 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	email := r.FormValue("email")
 	pass := r.FormValue("password")
+
+	if !strings.Contains(email, "@") {
+		jsonResponse(w, 400, map[string]interface{}{"error": "invalid email"})
+		return
+	}
 
 	var hash string
 	var verified bool
@@ -344,10 +405,17 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, _ := generateJWT(email)
+	token, err := generateJWT(email)
+	if err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "token error"})
+		return
+	}
 
 	var id int
-	db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id)
+	if err = db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id); err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "user not found"})
+		return
+	}
 
 	refresh := generateRefreshToken()
 	if _, err = db.Exec(
@@ -361,10 +429,22 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func meHandler(w http.ResponseWriter, r *http.Request) {
-	if corsWithOrigin(w, r) { return }
+	if corsWithOrigin(w, r) {
+		return
+	}
 
-	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
-	email, _ := parseJWT(token)
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		jsonResponse(w, 401, map[string]interface{}{"error": "No token"})
+		return
+	}
+
+	token := strings.Replace(auth, "Bearer ", "", 1)
+	email, err := parseJWT(token)
+	if err != nil {
+		jsonResponse(w, 401, map[string]interface{}{"error": "Invalid token"})
+		return
+	}
 
 	jsonResponse(w, 200, map[string]interface{}{"email": email})
 }
@@ -379,11 +459,13 @@ func profileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
-	email, _ := parseJWT(token)
+	email := r.Context().Value("userEmail").(string)
 
 	var id int
-	db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id)
+	if err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id); err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "user not found"})
+		return
+	}
 
 	if r.Method == "POST" {
 		name := r.FormValue("name")
@@ -401,7 +483,10 @@ func profileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var name, avatar string
-	db.QueryRow("SELECT name,avatar_url FROM profiles WHERE user_id=$1", id).Scan(&name, &avatar)
+	if err := db.QueryRow("SELECT name,avatar_url FROM profiles WHERE user_id=$1", id).Scan(&name, &avatar); err != nil {
+		name = ""
+		avatar = ""
+	}
 
 	jsonResponse(w, 200, map[string]interface{}{"name": name, "avatar": avatar})
 }
@@ -416,23 +501,36 @@ func addResultHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
-	email, _ := parseJWT(token)
+	email := r.Context().Value("userEmail").(string)
 
 	var id int
-	db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id)
+	if err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id); err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "user not found"})
+		return
+	}
 
 	subject := r.FormValue("subject")
 	score := r.FormValue("score")
 	total := r.FormValue("total")
 
 	var scoreInt, totalInt int
-	fmt.Sscanf(score, "%d", &scoreInt)
-	fmt.Sscanf(total, "%d", &totalInt)
+	if _, err := fmt.Sscanf(score, "%d", &scoreInt); err != nil {
+		jsonResponse(w, 400, map[string]interface{}{"error": "invalid score"})
+		return
+	}
+	if _, err := fmt.Sscanf(total, "%d", &totalInt); err != nil {
+		jsonResponse(w, 400, map[string]interface{}{"error": "invalid total"})
+		return
+	}
 
-	percent := 0.0
+	if subject == "" || totalInt <= 0 || scoreInt < 0 || scoreInt > totalInt {
+		jsonResponse(w, 400, map[string]interface{}{"error": "invalid data"})
+		return
+	}
+
+	percent := 0
 	if totalInt > 0 {
-		percent = float64(scoreInt) / float64(totalInt) * 100
+		percent = (scoreInt * 100) / totalInt
 	}
 
 	if _, err := db.Exec("INSERT INTO test_results (user_id,subject,score,total,percent) VALUES ($1,$2,$3,$4,$5)",
@@ -445,13 +543,15 @@ func addResultHandler(w http.ResponseWriter, r *http.Request) {
 
 func getResultsHandler(w http.ResponseWriter, r *http.Request) {
 
-	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
-	email, _ := parseJWT(token)
+	email := r.Context().Value("userEmail").(string)
 
 	var id int
-	db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id)
+	if err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id); err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "user not found"})
+		return
+	}
 
-	rows, err := db.Query("SELECT subject,score,total FROM test_results WHERE user_id=$1", id)
+	rows, err := db.Query("SELECT subject,score,total,percent FROM test_results WHERE user_id=$1", id)
 	if err != nil {
 		jsonResponse(w, 500, map[string]interface{}{"error": "DB error"})
 		return
@@ -462,13 +562,16 @@ func getResultsHandler(w http.ResponseWriter, r *http.Request) {
 
 	for rows.Next() {
 		var s string
-		var sc, t int
-		rows.Scan(&s, &sc, &t)
+		var sc, t, p int
+		if err := rows.Scan(&s, &sc, &t, &p); err != nil {
+			continue
+		}
 
 		results = append(results, map[string]interface{}{
 			"subject": s,
 			"score":   sc,
 			"total":   t,
+			"percent": p,
 		})
 	}
 
@@ -479,16 +582,21 @@ func getResultsHandler(w http.ResponseWriter, r *http.Request) {
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 
-	token := strings.Replace(r.Header.Get("Authorization"), "Bearer ", "", 1)
-	email, _ := parseJWT(token)
+	email := r.Context().Value("userEmail").(string)
 
 	var id int
-	db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id)
+	if err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id); err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "user not found"})
+		return
+	}
 
 	var count int
 	var avg float64
 
-	db.QueryRow("SELECT COUNT(*),COALESCE(AVG(score),0) FROM test_results WHERE user_id=$1", id).Scan(&count, &avg)
+	if err := db.QueryRow("SELECT COUNT(*),COALESCE(AVG(percent),0) FROM test_results WHERE user_id=$1", id).Scan(&count, &avg); err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "DB error"})
+		return
+	}
 
 	jsonResponse(w, 200, map[string]interface{}{
 		"total_tests": count,
@@ -554,7 +662,9 @@ LIMIT 20
 // ---------- REFRESH / LOGOUT ----------
 
 func refreshHandler(w http.ResponseWriter, r *http.Request) {
-	if corsWithOrigin(w, r) { return }
+	if corsWithOrigin(w, r) {
+		return
+	}
 
 	ip := getIP(r)
 	if !checkRateLimit("refresh:"+ip, 10, 5*time.Minute) {
@@ -563,6 +673,11 @@ func refreshHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	refresh := r.FormValue("refresh")
+
+	if refresh == "" {
+		jsonResponse(w, 400, map[string]interface{}{"error": "no refresh"})
+		return
+	}
 
 	var userID int
 	err := db.QueryRow(
@@ -581,6 +696,10 @@ func refreshHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	newRefresh := generateRefreshToken()
+	if newRefresh == "" {
+		jsonResponse(w, 500, map[string]interface{}{"error": "token generation failed"})
+		return
+	}
 
 	_, err = db.Exec(
 		"INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1,$2,$3)",
@@ -591,9 +710,16 @@ func refreshHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var email string
-	db.QueryRow("SELECT email FROM users WHERE id=$1", userID).Scan(&email)
+	if err := db.QueryRow("SELECT email FROM users WHERE id=$1", userID).Scan(&email); err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "user not found"})
+		return
+	}
 
-	newToken, _ := generateJWT(email)
+	newToken, err := generateJWT(email)
+	if err != nil {
+		jsonResponse(w, 500, map[string]interface{}{"error": "token error"})
+		return
+	}
 
 	jsonResponse(w, 200, map[string]interface{}{
 		"token":   newToken,
@@ -611,6 +737,11 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	refresh := r.FormValue("refresh")
+
+	if refresh == "" {
+		jsonResponse(w, 400, map[string]interface{}{"error": "no refresh"})
+		return
+	}
 
 	if _, err := db.Exec("DELETE FROM refresh_tokens WHERE token=$1 AND user_id=$2", refresh, userID); err != nil {
 		log.Println("DB error:", err)
@@ -690,5 +821,7 @@ func main() {
 	}
 
 	fmt.Println("Server running on", port)
-	http.ListenAndServe(":"+port, nil)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatal(err)
+	}
 }
