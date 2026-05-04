@@ -382,6 +382,28 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// FIX: если email уже есть но НЕ верифицирован — разрешаем повторную регистрацию
+	// (обновляем хэш пароля, verified остаётся false)
+	// Если верифицирован — блокируем с ошибкой "exists"
+	var existingVerified bool
+	err = db.QueryRow("SELECT verified FROM users WHERE email=$1", email).Scan(&existingVerified)
+	if err == nil {
+		// Пользователь найден
+		if existingVerified {
+			// Аккаунт уже полностью зарегистрирован — блокируем
+			jsonResponse(w, 400, map[string]interface{}{"error": "exists"})
+			return
+		}
+		// Не верифицирован — обновляем пароль и даём попробовать снова
+		if _, err = db.Exec("UPDATE users SET password_hash=$1 WHERE email=$2", string(hash), email); err != nil {
+			jsonResponse(w, 500, map[string]interface{}{"error": "Server error"})
+			return
+		}
+		jsonResponse(w, 200, map[string]interface{}{"status": "ok"})
+		return
+	}
+
+	// Пользователя нет — создаём нового
 	_, err = db.Exec("INSERT INTO users (email,password_hash,verified) VALUES ($1,$2,false)", email, string(hash))
 	if err != nil {
 		jsonResponse(w, 400, map[string]interface{}{"error": "exists"})
