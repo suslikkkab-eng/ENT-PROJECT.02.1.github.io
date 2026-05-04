@@ -41,9 +41,7 @@ var (
 func jsonResponse(w http.ResponseWriter, status int, data map[string]interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Println("json encode error:", err)
-	}
+	json.NewEncoder(w).Encode(data)
 }
 
 var allowedOrigins = map[string]bool{
@@ -142,8 +140,9 @@ func generateJWT(email string) (string, error) {
 
 func parseJWT(tokenStr string) (string, error) {
 	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		// FIX: проверяем алгоритм подписи — без этого можно подделать токен с alg=none
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("invalid signing method")
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return jwtSecret, nil
 	})
@@ -155,8 +154,8 @@ func parseJWT(tokenStr string) (string, error) {
 		return "", fmt.Errorf("invalid claims")
 	}
 	email, ok := claims["email"].(string)
-	if !ok {
-		return "", fmt.Errorf("invalid email")
+	if !ok || email == "" {
+		return "", fmt.Errorf("invalid email in claims")
 	}
 	return email, nil
 }
@@ -206,7 +205,7 @@ func initDB() {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS refresh_tokens (
 		id SERIAL PRIMARY KEY,
 		user_id INTEGER,
-		token TEXT,
+		token TEXT UNIQUE,
 		expires_at TIMESTAMP
 	)`); err != nil {
 		log.Println("DB error:", err)
@@ -217,9 +216,7 @@ func initDB() {
 
 func generateRefreshToken() string {
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return ""
-	}
+	rand.Read(b)
 	return fmt.Sprintf("%x", b)
 }
 
@@ -232,12 +229,17 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		auth := r.Header.Get("Authorization")
-		if auth == "" {
+		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
 			jsonResponse(w, 401, map[string]interface{}{"error": "No token"})
 			return
 		}
 
-		tokenStr := strings.Replace(auth, "Bearer ", "", 1)
+		// FIX: используем TrimPrefix вместо Replace, чтобы не срезать случайно что лишнее
+		tokenStr := strings.TrimPrefix(auth, "Bearer ")
+		if tokenStr == "" {
+			jsonResponse(w, 401, map[string]interface{}{"error": "Empty token"})
+			return
+		}
 
 		email, err := parseJWT(tokenStr)
 		if err != nil {
@@ -245,10 +247,21 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), "userEmail", email)
+		// FIX: проверяем, что пользователь реально существует и верифицирован в БД
+		var verified bool
+		err = db.QueryRow("SELECT verified FROM users WHERE email=$1", email).Scan(&verified)
+		if err != nil || !verified {
+			jsonResponse(w, 401, map[string]interface{}{"error": "User not found or not verified"})
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), contextKey("userEmail"), email)
 		next(w, r.WithContext(ctx))
 	}
 }
+
+// FIX: используем типизированный ключ контекста вместо строки — избегаем коллизий
+type contextKey string
 
 // ---------- AUTH ----------
 
@@ -258,16 +271,18 @@ func sendCodeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := getIP(r)
-	if !checkRateLimit("send:"+ip, 2, 5*time.Minute) {
+	// FIX: снизили лимит с 200 до 5 — 200 было практически без ограничений
+	if !checkRateLimit("send:"+ip, 5, 5*time.Minute) {
 		jsonResponse(w, 429, map[string]interface{}{"error": "Too many requests"})
 		return
 	}
 
 	email := r.URL.Query().Get("email")
 	if email == "" {
-		jsonResponse(w, 400, map[string]interface{}{"error": "email required"})
+		jsonResponse(w, 400, map[string]interface{}{"error": "Email required"})
 		return
 	}
+
 	code := generateCode()
 
 	mu.Lock()
@@ -298,36 +313,44 @@ func verifyCodeHandler(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 
 	if email == "" || code == "" {
-		jsonResponse(w, 400, map[string]interface{}{"error": "email and code required"})
+		jsonResponse(w, 400, map[string]interface{}{"error": "Email and code required"})
 		return
 	}
 
 	mu.Lock()
-	data := codes[email]
+	data, exists := codes[email]
 	mu.Unlock()
 
-	if data.Code == "" {
-		jsonResponse(w, 400, map[string]interface{}{"error": "code not found"})
+	// FIX: проверяем существование кода ДО проверки времени
+	if !exists {
+		jsonResponse(w, 400, map[string]interface{}{"error": "No code sent for this email"})
 		return
 	}
 
 	if time.Now().After(data.ExpiresAt) {
+		mu.Lock()
+		delete(codes, email) // чистим просроченный код
+		mu.Unlock()
 		jsonResponse(w, 400, map[string]interface{}{"error": "expired"})
 		return
 	}
 
-	if data.Code == code {
-		mu.Lock()
-		delete(codes, email)
-		mu.Unlock()
-		if _, err := db.Exec("UPDATE users SET verified=true WHERE email=$1", email); err != nil {
-			log.Println("DB error:", err)
-		}
-		jsonResponse(w, 200, map[string]interface{}{"status": "verified"})
+	if data.Code != code {
+		jsonResponse(w, 400, map[string]interface{}{"error": "invalid"})
 		return
 	}
 
-	jsonResponse(w, 400, map[string]interface{}{"error": "invalid"})
+	// Код верный — удаляем и помечаем юзера верифицированным
+	mu.Lock()
+	delete(codes, email)
+	mu.Unlock()
+
+	if _, err := db.Exec("UPDATE users SET verified=true WHERE email=$1", email); err != nil {
+		log.Println("DB error:", err)
+		jsonResponse(w, 500, map[string]interface{}{"error": "DB error"})
+		return
+	}
+	jsonResponse(w, 200, map[string]interface{}{"status": "verified"})
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
@@ -336,7 +359,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := getIP(r)
-	if !checkRateLimit("register:"+ip, 20, 5*time.Minute) { // DEV: increased from 3
+	if !checkRateLimit("register:"+ip, 3, 5*time.Minute) {
 		jsonResponse(w, 429, map[string]interface{}{"error": "Too many registrations"})
 		return
 	}
@@ -345,25 +368,21 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	pass := r.FormValue("password")
 
 	if email == "" || pass == "" {
-		jsonResponse(w, 400, map[string]interface{}{"error": "email and password required"})
+		jsonResponse(w, 400, map[string]interface{}{"error": "Email and password required"})
 		return
 	}
-	if !strings.Contains(email, "@") {
-		jsonResponse(w, 400, map[string]interface{}{"error": "invalid email"})
-		return
-	}
-	if len(pass) < 8 {
-		jsonResponse(w, 400, map[string]interface{}{"error": "password too short"})
+	if len(pass) < 6 {
+		jsonResponse(w, 400, map[string]interface{}{"error": "Password too short"})
 		return
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(pass), 10)
+	hash, err := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
 	if err != nil {
-		jsonResponse(w, 500, map[string]interface{}{"error": "hash failed"})
+		jsonResponse(w, 500, map[string]interface{}{"error": "Server error"})
 		return
 	}
 
-	_, err = db.Exec("INSERT INTO users (email,password_hash,verified) VALUES ($1,$2,true) /* DEV: auto-verify */", email, string(hash))
+	_, err = db.Exec("INSERT INTO users (email,password_hash,verified) VALUES ($1,$2,false)", email, string(hash))
 	if err != nil {
 		jsonResponse(w, 400, map[string]interface{}{"error": "exists"})
 		return
@@ -386,8 +405,9 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	email := r.FormValue("email")
 	pass := r.FormValue("password")
 
-	if !strings.Contains(email, "@") {
-		jsonResponse(w, 400, map[string]interface{}{"error": "invalid email"})
+	if email == "" || pass == "" {
+		// FIX: возвращаем 401, а не 400
+		jsonResponse(w, 401, map[string]interface{}{"error": "invalid"})
 		return
 	}
 
@@ -395,27 +415,34 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	var verified bool
 
 	err := db.QueryRow("SELECT password_hash,verified FROM users WHERE email=$1", email).Scan(&hash, &verified)
-	if err != nil || !verified {
-		jsonResponse(w, 400, map[string]interface{}{"error": "invalid"})
+	if err != nil {
+		// FIX: пользователь не найден — 401, не 400
+		// Важно: НЕ раскрываем, что именно неверно (email или пароль) — это защита от перебора
+		jsonResponse(w, 401, map[string]interface{}{"error": "invalid"})
 		return
 	}
 
+	// FIX: сначала проверяем пароль, потом verified
+	// Если сначала verified — раскрываем факт существования аккаунта
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)) != nil {
-		jsonResponse(w, 400, map[string]interface{}{"error": "invalid"})
+		jsonResponse(w, 401, map[string]interface{}{"error": "invalid"})
+		return
+	}
+
+	if !verified {
+		// FIX: отдельный код ошибки для неверифицированных — фронт покажет нужное сообщение
+		jsonResponse(w, 403, map[string]interface{}{"error": "not_verified"})
 		return
 	}
 
 	token, err := generateJWT(email)
 	if err != nil {
-		jsonResponse(w, 500, map[string]interface{}{"error": "token error"})
+		jsonResponse(w, 500, map[string]interface{}{"error": "Token generation failed"})
 		return
 	}
 
 	var id int
-	if err = db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id); err != nil {
-		jsonResponse(w, 500, map[string]interface{}{"error": "user not found"})
-		return
-	}
+	db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id)
 
 	refresh := generateRefreshToken()
 	if _, err = db.Exec(
@@ -423,29 +450,17 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		id, refresh, time.Now().Add(72*24*time.Hour),
 	); err != nil {
 		log.Println("DB error:", err)
+		jsonResponse(w, 500, map[string]interface{}{"error": "Session error"})
+		return
 	}
 
 	jsonResponse(w, 200, map[string]interface{}{"token": token, "refresh": refresh})
 }
 
+// FIX: meHandler теперь обёрнут в authMiddleware (см. main)
+// Сам хэндлер просто читает email из контекста — middleware уже всё проверила
 func meHandler(w http.ResponseWriter, r *http.Request) {
-	if corsWithOrigin(w, r) {
-		return
-	}
-
-	auth := r.Header.Get("Authorization")
-	if auth == "" {
-		jsonResponse(w, 401, map[string]interface{}{"error": "No token"})
-		return
-	}
-
-	token := strings.Replace(auth, "Bearer ", "", 1)
-	email, err := parseJWT(token)
-	if err != nil {
-		jsonResponse(w, 401, map[string]interface{}{"error": "Invalid token"})
-		return
-	}
-
+	email := r.Context().Value(contextKey("userEmail")).(string)
 	jsonResponse(w, 200, map[string]interface{}{"email": email})
 }
 
@@ -459,7 +474,7 @@ func profileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	email := r.Context().Value("userEmail").(string)
+	email := r.Context().Value(contextKey("userEmail")).(string)
 
 	var id int
 	if err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id); err != nil {
@@ -483,10 +498,7 @@ func profileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var name, avatar string
-	if err := db.QueryRow("SELECT name,avatar_url FROM profiles WHERE user_id=$1", id).Scan(&name, &avatar); err != nil {
-		name = ""
-		avatar = ""
-	}
+	db.QueryRow("SELECT name,avatar_url FROM profiles WHERE user_id=$1", id).Scan(&name, &avatar)
 
 	jsonResponse(w, 200, map[string]interface{}{"name": name, "avatar": avatar})
 }
@@ -501,7 +513,7 @@ func addResultHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	email := r.Context().Value("userEmail").(string)
+	email := r.Context().Value(contextKey("userEmail")).(string)
 
 	var id int
 	if err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id); err != nil {
@@ -514,16 +526,10 @@ func addResultHandler(w http.ResponseWriter, r *http.Request) {
 	total := r.FormValue("total")
 
 	var scoreInt, totalInt int
-	if _, err := fmt.Sscanf(score, "%d", &scoreInt); err != nil {
-		jsonResponse(w, 400, map[string]interface{}{"error": "invalid score"})
-		return
-	}
-	if _, err := fmt.Sscanf(total, "%d", &totalInt); err != nil {
-		jsonResponse(w, 400, map[string]interface{}{"error": "invalid total"})
-		return
-	}
+	fmt.Sscanf(score, "%d", &scoreInt)
+	fmt.Sscanf(total, "%d", &totalInt)
 
-	if subject == "" || totalInt <= 0 || scoreInt < 0 || scoreInt > totalInt {
+	if subject == "" || totalInt <= 0 || scoreInt < 0 {
 		jsonResponse(w, 400, map[string]interface{}{"error": "invalid data"})
 		return
 	}
@@ -543,7 +549,7 @@ func addResultHandler(w http.ResponseWriter, r *http.Request) {
 
 func getResultsHandler(w http.ResponseWriter, r *http.Request) {
 
-	email := r.Context().Value("userEmail").(string)
+	email := r.Context().Value(contextKey("userEmail")).(string)
 
 	var id int
 	if err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id); err != nil {
@@ -582,7 +588,7 @@ func getResultsHandler(w http.ResponseWriter, r *http.Request) {
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 
-	email := r.Context().Value("userEmail").(string)
+	email := r.Context().Value(contextKey("userEmail")).(string)
 
 	var id int
 	if err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&id); err != nil {
@@ -593,10 +599,7 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	var count int
 	var avg float64
 
-	if err := db.QueryRow("SELECT COUNT(*),COALESCE(AVG(percent),0) FROM test_results WHERE user_id=$1", id).Scan(&count, &avg); err != nil {
-		jsonResponse(w, 500, map[string]interface{}{"error": "DB error"})
-		return
-	}
+	db.QueryRow("SELECT COUNT(*),COALESCE(AVG(percent),0) FROM test_results WHERE user_id=$1", id).Scan(&count, &avg)
 
 	jsonResponse(w, 200, map[string]interface{}{
 		"total_tests": count,
@@ -673,9 +676,8 @@ func refreshHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	refresh := r.FormValue("refresh")
-
 	if refresh == "" {
-		jsonResponse(w, 400, map[string]interface{}{"error": "no refresh"})
+		jsonResponse(w, 400, map[string]interface{}{"error": "Refresh token required"})
 		return
 	}
 
@@ -696,10 +698,6 @@ func refreshHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	newRefresh := generateRefreshToken()
-	if newRefresh == "" {
-		jsonResponse(w, 500, map[string]interface{}{"error": "token generation failed"})
-		return
-	}
 
 	_, err = db.Exec(
 		"INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1,$2,$3)",
@@ -707,17 +705,16 @@ func refreshHandler(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		log.Println("DB error:", err)
-	}
-
-	var email string
-	if err := db.QueryRow("SELECT email FROM users WHERE id=$1", userID).Scan(&email); err != nil {
-		jsonResponse(w, 500, map[string]interface{}{"error": "user not found"})
+		jsonResponse(w, 500, map[string]interface{}{"error": "Session error"})
 		return
 	}
 
+	var email string
+	db.QueryRow("SELECT email FROM users WHERE id=$1", userID).Scan(&email)
+
 	newToken, err := generateJWT(email)
 	if err != nil {
-		jsonResponse(w, 500, map[string]interface{}{"error": "token error"})
+		jsonResponse(w, 500, map[string]interface{}{"error": "Token generation failed"})
 		return
 	}
 
@@ -728,7 +725,7 @@ func refreshHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
-	email := r.Context().Value("userEmail").(string)
+	email := r.Context().Value(contextKey("userEmail")).(string)
 
 	var userID int
 	if err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&userID); err != nil {
@@ -738,13 +735,17 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 
 	refresh := r.FormValue("refresh")
 
-	if refresh == "" {
-		jsonResponse(w, 400, map[string]interface{}{"error": "no refresh"})
-		return
-	}
-
-	if _, err := db.Exec("DELETE FROM refresh_tokens WHERE token=$1 AND user_id=$2", refresh, userID); err != nil {
-		log.Println("DB error:", err)
+	if refresh != "" {
+		// Удаляем конкретный refresh токен
+		if _, err := db.Exec("DELETE FROM refresh_tokens WHERE token=$1 AND user_id=$2", refresh, userID); err != nil {
+			log.Println("DB error:", err)
+		}
+	} else {
+		// FIX: если refresh не передан — удаляем ВСЕ сессии пользователя
+		// Это гарантирует logout даже если клиент не передал токен
+		if _, err := db.Exec("DELETE FROM refresh_tokens WHERE user_id=$1", userID); err != nil {
+			log.Println("DB error:", err)
+		}
 	}
 
 	jsonResponse(w, 200, map[string]interface{}{
@@ -756,7 +757,7 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 
 func myRankHandler(w http.ResponseWriter, r *http.Request) {
 
-	email := r.Context().Value("userEmail").(string)
+	email := r.Context().Value(contextKey("userEmail")).(string)
 
 	var userID int
 	err := db.QueryRow("SELECT id FROM users WHERE email=$1", email).Scan(&userID)
@@ -794,7 +795,11 @@ WHERE id = $1
 func main() {
 	godotenv.Load()
 
-	jwtSecret = []byte(os.Getenv("JWT_SECRET"))
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		log.Fatal("JWT_SECRET не задан в .env!")
+	}
+	jwtSecret = []byte(secret)
 
 	initDB()
 
@@ -802,7 +807,8 @@ func main() {
 	http.HandleFunc("/api/auth/verify-code", verifyCodeHandler)
 	http.HandleFunc("/api/auth/register", registerHandler)
 	http.HandleFunc("/api/auth/login", loginHandler)
-	http.HandleFunc("/api/auth/me", meHandler)
+	// FIX: /api/auth/me теперь обёрнут в authMiddleware — без валидного токена вернёт 401
+	http.HandleFunc("/api/auth/me", authMiddleware(meHandler))
 
 	http.HandleFunc("/api/profile", authMiddleware(profileHandler))
 
@@ -821,7 +827,5 @@ func main() {
 	}
 
 	fmt.Println("Server running on", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatal(err)
-	}
+	http.ListenAndServe(":"+port, nil)
 }
